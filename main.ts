@@ -23,15 +23,26 @@ for (const [o, i, p, u] of [
 
 const TB = new Uint8Array(12); // scratch for PRINT's decimal digits
 
+// ISA limits (program/v1): step cap -> trap 10, output cap -> trap 11,
+// data stack and memory are 256 words, call stack is 64 deep, shift
+// counts are masked to 5 bits.
+const MAX_STEPS = 1000000;
+const MAX_OUTPUT = 65536;
+const STACK_SIZE = 256;
+const MEM_WORDS = 256;
+const CALL_DEPTH = 64;
+const SHIFT_MASK = 31;
+const INT_MIN = -2147483648;
+
 function run(p, inp) {
   const n = p.length;
-  const D = new Int32Array(256);
-  const C = new Int32Array(64);
-  const M = new Int32Array(256);
-  const out = new Uint8Array(65536);
+  const D = new Int32Array(STACK_SIZE);
+  const C = new Int32Array(CALL_DEPTH);
+  const M = new Int32Array(MEM_WORDS);
+  const out = new Uint8Array(MAX_OUTPUT);
   let sp = 0, cp = 0, ol = 0, ip = 0, pc = 0, steps = 0;
   for (;;) {
-    if (steps === 1000000) return [out.subarray(0, ol), 10];
+    if (steps === MAX_STEPS) return [out.subarray(0, ol), 10];
     if (pc < 0 || pc >= n) return [out.subarray(0, ol), 9];
     const op = p[pc];
     const e = T[op];
@@ -42,7 +53,7 @@ function run(p, inp) {
     const next = pc + 1 + imm;
     const pops = (v >> 3) & 3, pushes = (v >> 5) & 3;
     if (sp < pops) return [out.subarray(0, ol), 2];
-    if (sp - pops + pushes > 256) return [out.subarray(0, ol), 3];
+    if (sp - pops + pushes > STACK_SIZE) return [out.subarray(0, ol), 3];
     pc = next;
     if (op >= 0x10 && op <= 0x22 && op !== 0x17 && op !== 0x1b) {
       const b = D[sp - 1], a = D[sp - 2];
@@ -53,9 +64,11 @@ function run(p, inp) {
         case 0x12: r = Math.imul(a, b); break;
         case 0x13:
           if (b === 0) return [out.subarray(0, ol), 4];
-          r = a === -2147483648 && b === -1 ? a : (a / b) | 0; break;
+          // INT_MIN / -1 would overflow a 32-bit result; the ISA keeps INT_MIN.
+          r = a === INT_MIN && b === -1 ? a : (a / b) | 0; break;
         case 0x14:
           if (b === 0) return [out.subarray(0, ol), 4];
+          // x % -1 is always 0; guard it so JS % semantics never leak in.
           r = b === -1 ? 0 : (a % b) | 0; break;
         case 0x15:
           if (b === 0) return [out.subarray(0, ol), 4];
@@ -66,9 +79,9 @@ function run(p, inp) {
         case 0x18: r = a & b; break;
         case 0x19: r = a | b; break;
         case 0x1a: r = a ^ b; break;
-        case 0x1c: r = a << (b & 31); break;
-        case 0x1d: r = a >> (b & 31); break;
-        case 0x1e: r = (a >>> (b & 31)) | 0; break;
+        case 0x1c: r = a << (b & SHIFT_MASK); break;
+        case 0x1d: r = a >> (b & SHIFT_MASK); break;
+        case 0x1e: r = (a >>> (b & SHIFT_MASK)) | 0; break;
         case 0x20: r = a === b ? 1 : 0; break;
         case 0x21: r = a < b ? 1 : 0; break;
         default: r = (a >>> 0) < (b >>> 0) ? 1 : 0; // LTU
@@ -96,7 +109,7 @@ function run(p, inp) {
         break;
       }
       case 0x33: // CALL
-        if (cp === 64) return [out.subarray(0, ol), 7];
+        if (cp === CALL_DEPTH) return [out.subarray(0, ol), 7];
         C[cp++] = next;
         pc = p[next - 2] | (p[next - 1] << 8);
         break;
@@ -106,13 +119,13 @@ function run(p, inp) {
         break;
       case 0x40: { // LOAD
         const a = D[sp - 1];
-        if (a < 0 || a >= 256) return [out.subarray(0, ol), 6];
+        if (a < 0 || a >= MEM_WORDS) return [out.subarray(0, ol), 6];
         D[sp - 1] = M[a];
         break;
       }
       case 0x41: { // STORE
         const a = D[sp - 1], w = D[sp - 2];
-        if (a < 0 || a >= 256) return [out.subarray(0, ol), 6];
+        if (a < 0 || a >= MEM_WORDS) return [out.subarray(0, ol), 6];
         sp -= 2;
         M[a] = w;
         break;
@@ -123,14 +136,14 @@ function run(p, inp) {
         let d = 0;
         do { TB[d++] = 48 + (u % 10); u = (u / 10) | 0; } while (u > 0);
         const len = d + (neg ? 1 : 0);
-        if (ol + len > 65536) return [out.subarray(0, ol), 11];
+        if (ol + len > MAX_OUTPUT) return [out.subarray(0, ol), 11];
         sp--;
         if (neg) out[ol++] = 45;
         while (d > 0) out[ol++] = TB[--d];
         break;
       }
       case 0x51: // PUTC
-        if (ol + 1 > 65536) return [out.subarray(0, ol), 11];
+        if (ol + 1 > MAX_OUTPUT) return [out.subarray(0, ol), 11];
         out[ol++] = D[--sp] & 255;
         break;
       case 0x52: D[sp++] = ip < inp.length ? inp[ip++] : -1; break; // IN
